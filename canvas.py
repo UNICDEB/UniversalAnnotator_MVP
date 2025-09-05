@@ -345,34 +345,29 @@
 
 from PySide6.QtWidgets import (
     QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QMenu
+    QMenu, QInputDialog, QMessageBox
 )
+from PySide6.QtGui import QAction
 
 from PySide6.QtGui import (
-    QPixmap, QImage, QPainterPath, QMouseEvent, QPainter,
-    QAction, QPen, QColor
+    QPixmap, QImage, QPainterPath, QMouseEvent,
+    QPainter, QColor, QPen
 )
-
 from PySide6.QtCore import Qt, QPointF, QRectF
-import cv2, numpy as np, uuid
+import cv2, uuid, random
 
 from models import Shape, ImageAnn
 
 
-# 🎨 Fixed color map for classes
-COLOR_MAP = {}
-
-def get_color(cls: str) -> QColor:
-    """Return consistent color for each class."""
-    if cls not in COLOR_MAP:
-        # Pick bright deterministic color based on class name hash
-        palette = [
-            QColor("red"), QColor("green"), QColor("blue"),
-            QColor("orange"), QColor("purple"), QColor("cyan"),
-            QColor("magenta"), QColor("yellow")
-        ]
-        COLOR_MAP[cls] = palette[hash(cls) % len(palette)]
-    return COLOR_MAP[cls]
+# ----------------------------
+# Load classes from classes.txt
+# ----------------------------
+def load_classes_from_file(path="classes.txt"):
+    try:
+        with open(path, "r") as f:
+            return [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
 
 
 class AnnotCanvas(QGraphicsView):
@@ -384,17 +379,23 @@ class AnnotCanvas(QGraphicsView):
         self.setRenderHints(self.renderHints() | QPainter.Antialiasing)
         self.pix = None
         self.active_cls = ""
-        self.mode = "select"  # rect, polygon, circle, line, keypoint
+        self.mode = "select"   # rect, polygon, circle, line, keypoint
         self.temp_points = []
+        self.preview_item = None
         self.setMouseTracking(True)
 
-        # ✅ Enable zoom
+        # Enable zoom
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
 
+    # ----------------------------
+    # Load image
+    # ----------------------------
     def load_image(self, path: str):
         self.scene.clear()
         img = cv2.imread(path)
+        if img is None:
+            return
         h, w = img.shape[:2]
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, w*3, QImage.Format_RGB888)
@@ -407,14 +408,9 @@ class AnnotCanvas(QGraphicsView):
             for s in ann.shapes:
                 self._draw_shape(s)
 
-    def set_active_class(self, cls: str):
-        """Set the current active class (only once, no partial names)."""
-        cls = cls.strip()
-        if cls and cls not in self.state.classes:
-            self.state.classes.append(cls)
-        self.active_cls = cls
-
-    # ✅ Zoom with mouse wheel
+    # ----------------------------
+    # Zoom support
+    # ----------------------------
     def wheelEvent(self, event):
         zoom_in, zoom_out = 1.25, 0.8
         if event.angleDelta().y() > 0:
@@ -422,7 +418,9 @@ class AnnotCanvas(QGraphicsView):
         else:
             self.scale(zoom_out, zoom_out)
 
-    # ✅ Context menu for choosing shape type
+    # ----------------------------
+    # Context menu for choosing shape type
+    # ----------------------------
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         actions = {
@@ -430,7 +428,8 @@ class AnnotCanvas(QGraphicsView):
             "Polygon": "polygon",
             "Circle": "circle",
             "Line": "line",
-            "Keypoint": "keypoint"
+            "Keypoint": "keypoint",
+            "Select/Move": "select"
         }
         for name, mode in actions.items():
             act = QAction(name, self)
@@ -441,9 +440,30 @@ class AnnotCanvas(QGraphicsView):
     def _set_mode(self, mode):
         self.mode = mode
         self.temp_points.clear()
+        if self.preview_item:
+            self.scene.removeItem(self.preview_item)
+            self.preview_item = None
 
+    # ----------------------------
+    # Class chooser
+    # ----------------------------
+    def _choose_class(self):
+        classes = load_classes_from_file()
+        if not classes:
+            QMessageBox.warning(self, "No Classes", "classes.txt is empty or missing!")
+            return ""
+        cls, ok = QInputDialog.getItem(
+            self, "Select Class",
+            "Choose class for annotation:",
+            classes, 0, False
+        )
+        return cls if ok else ""
+
+    # ----------------------------
+    # Mouse events
+    # ----------------------------
     def mousePressEvent(self, e: QMouseEvent):
-        if not self.state.images: 
+        if not self.state.images:
             return
         scene_pos = self.mapToScene(e.pos())
         if self.mode in ("rect", "circle", "line"):
@@ -451,67 +471,109 @@ class AnnotCanvas(QGraphicsView):
         elif self.mode in ("polygon", "polyline"):
             self.temp_points.append([scene_pos.x(), scene_pos.y()])
         elif self.mode == "keypoint":
-            sh = Shape(str(uuid.uuid4()), self.active_cls, "keypoint",
+            sh = Shape(str(uuid.uuid4()), "", "keypoint",
                        [[scene_pos.x(), scene_pos.y()]], {})
             self._store_shape(sh)
             self._draw_shape(sh)
         else:
             super().mousePressEvent(e)
 
+    def mouseMoveEvent(self, e: QMouseEvent):
+        if not self.temp_points:
+            return
+        scene_pos = self.mapToScene(e.pos())
+        if self.preview_item:
+            self.scene.removeItem(self.preview_item)
+            self.preview_item = None
+
+        if self.mode == "rect":
+            p1 = self.temp_points[0]; p2 = [scene_pos.x(), scene_pos.y()]
+            rect = QRectF(min(p1[0], p2[0]), min(p1[1], p2[1]),
+                          abs(p2[0] - p1[0]), abs(p2[1] - p1[1]))
+            self.preview_item = self.scene.addRect(rect, QPen(QColor("yellow"), 2, Qt.DashLine))
+
+        elif self.mode == "circle":
+            c = self.temp_points[0]; edge = [scene_pos.x(), scene_pos.y()]
+            r = ((c[0]-edge[0])**2 + (c[1]-edge[1])**2) ** 0.5
+            rect = QRectF(c[0]-r, c[1]-r, 2*r, 2*r)
+            self.preview_item = self.scene.addEllipse(rect, QPen(QColor("yellow"), 2, Qt.DashLine))
+
+        elif self.mode == "line":
+            p1 = self.temp_points[0]; p2 = [scene_pos.x(), scene_pos.y()]
+            self.preview_item = self.scene.addLine(p1[0], p1[1], p2[0], p2[1],
+                                                   QPen(QColor("yellow"), 2, Qt.DashLine))
+
     def mouseReleaseEvent(self, e: QMouseEvent):
         scene_pos = self.mapToScene(e.pos())
+        if self.preview_item:
+            self.scene.removeItem(self.preview_item)
+            self.preview_item = None
+
+        sh = None
         if self.mode == "rect" and self.temp_points:
             p1 = self.temp_points[0]; p2 = [scene_pos.x(), scene_pos.y()]
-            sh = Shape(str(uuid.uuid4()), self.active_cls, "rect", [p1, p2], {})
-            self._store_shape(sh); self._draw_shape(sh)
-            self.temp_points.clear()
+            sh = Shape(str(uuid.uuid4()), "", "rect", [p1, p2], {})
         elif self.mode == "circle" and self.temp_points:
             c = self.temp_points[0]; edge = [scene_pos.x(), scene_pos.y()]
-            sh = Shape(str(uuid.uuid4()), self.active_cls, "circle", [c, edge], {})
-            self._store_shape(sh); self._draw_shape(sh)
-            self.temp_points.clear()
+            sh = Shape(str(uuid.uuid4()), "", "circle", [c, edge], {})
         elif self.mode == "line" and self.temp_points:
             p1 = self.temp_points[0]; p2 = [scene_pos.x(), scene_pos.y()]
-            sh = Shape(str(uuid.uuid4()), self.active_cls, "line", [p1, p2], {})
-            self._store_shape(sh); self._draw_shape(sh)
+            sh = Shape(str(uuid.uuid4()), "", "line", [p1, p2], {})
+
+        if sh:
+            self._store_shape(sh)
+            self._draw_shape(sh)
             self.temp_points.clear()
         else:
             super().mouseReleaseEvent(e)
 
     def mouseDoubleClickEvent(self, e: QMouseEvent):
         if self.mode in ("polygon", "polyline") and len(self.temp_points) >= 2:
-            sh = Shape(str(uuid.uuid4()), self.active_cls, self.mode,
+            sh = Shape(str(uuid.uuid4()), "", self.mode,
                        self.temp_points[:], {})
-            self._store_shape(sh); self._draw_shape(sh)
+            self._store_shape(sh)
+            self._draw_shape(sh)
             self.temp_points.clear()
         else:
             super().mouseDoubleClickEvent(e)
 
+    # ----------------------------
+    # Store and Draw Shape
+    # ----------------------------
     def _store_shape(self, sh: Shape):
+        cls = self._choose_class()
+        if cls:
+            sh.cls = cls
+            if cls not in self.state.classes:
+                self.state.classes.append(cls)
         path = self.state.images[self.state.index]
         ann = self.state.anns.get(path)
         ann.shapes.append(sh)
 
     def _draw_shape(self, sh: Shape):
-        # ✅ Consistent bright colors per class
-        color = get_color(sh.cls) if sh.cls else QColor("yellow")
-
-        # ✅ Thicker visible lines
-        pen = QPen(color, 4)
-        pen.setCosmetic(True)  # keep width constant during zoom
+        colors = [
+            QColor("red"), QColor("green"), QColor("blue"),
+            QColor("orange"), QColor("purple"), QColor("cyan")
+        ]
+        color = colors[hash(sh.cls) % len(colors)] if sh.cls else QColor("yellow")
+        pen = QPen(color, 3)
+        pen.setCosmetic(True)
 
         if sh.type == "rect":
             (x1, y1), (x2, y2) = sh.points
-            rect = QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+            rect = QRectF(min(x1, x2), min(y1, y2), abs(x2-x1), abs(y2-y1))
             self.scene.addRect(rect, pen)
+
         elif sh.type == "circle":
             (cx, cy), (ex, ey) = sh.points
-            r = ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5
-            rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
+            r = ((cx-ex)**2 + (cy-ey)**2)**0.5
+            rect = QRectF(cx-r, cy-r, 2*r, 2*r)
             self.scene.addEllipse(rect, pen)
+
         elif sh.type == "line":
             (x1, y1), (x2, y2) = sh.points
             self.scene.addLine(x1, y1, x2, y2, pen)
+
         elif sh.type in ("polygon", "polyline"):
             path = QPainterPath()
             pts = [QPointF(x, y) for x, y in sh.points]
@@ -523,7 +585,8 @@ class AnnotCanvas(QGraphicsView):
             if sh.type == "polygon":
                 path.closeSubpath()
             self.scene.addPath(path, pen)
+
         elif sh.type == "keypoint":
             (x, y) = sh.points[0]
-            r = 5.0
-            self.scene.addEllipse(QRectF(x - r, y - r, 2 * r, 2 * r), pen)
+            r = 4.0
+            self.scene.addEllipse(QRectF(x-r, y-r, 2*r, 2*r), pen)
